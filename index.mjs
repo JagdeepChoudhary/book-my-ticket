@@ -1,26 +1,31 @@
-//  CREATE TABLE seats (
-//      id SERIAL PRIMARY KEY,
-//      name VARCHAR(255),
-//      isbooked INT DEFAULT 0
-//  );
-// INSERT INTO seats (isbooked)
-// SELECT 0 FROM generate_series(1, 20);
+// CREATE TABLE seats (
+//     id SERIAL PRIMARY KEY,
+//     show_id INT NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+//     user_id INT REFERENCES users(id) ON DELETE SET NULL,
+//     seat_number VARCHAR(10) NOT NULL,  -- e.g. "A1", "B4"
+//     isbooked BOOLEAN DEFAULT FALSE,
+//     UNIQUE(show_id, seat_number)       -- no duplicate seats per show
+// );
 
 import express from "express";
 import pg from "pg";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
 import cors from "cors";
-
+import "dotenv/config";
+import authRoute from "./auth/auth.routes.js";
+import { authenticate } from "./auth/auth.middleware.js";
+import movieRoutes from "./movies/movie.routes.js";
+import bookingRoutes from "./bookings/booking.routes.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const port = process.env.PORT || 8080;
+const port = process.env.PORT || 5500;
 
 // Equivalent to mongoose connection
 // Pool is nothing but group of connections
 // If you pick one connection out of the pool and release it
 // the pooler will keep that connection open for sometime to other clients to reuse
-const pool = new pg.Pool({
+export const pool = new pg.Pool({
   host: "localhost",
   port: 5433,
   user: "postgres",
@@ -33,54 +38,132 @@ const pool = new pg.Pool({
 
 const app = new express();
 app.use(cors());
+app.use(express.json());
 
 app.get("/", (req, res) => {
   res.sendFile(__dirname + "/index.html");
 });
-//get all seats
-app.get("/seats", async (req, res) => {
-  const result = await pool.query("select * from seats"); // equivalent to Seats.find() in mongoose
-  res.send(result.rows);
-});
+// Assuming that movies and seats deatils not need auth
+app.use("/api/auth", authRoute);
+app.use("/movies", movieRoutes);
+app.use("/", bookingRoutes);
+// Get all movies
 
-//book a seat give the seatId and your name
+// Get all shows for a movie (with screen info)
 
-app.put("/:id/:name", async (req, res) => {
+
+// Get all seats for a show
+app.get("/shows/:showId/seats", async (req, res) => {
   try {
-    const id = req.params.id;
-    const name = req.params.name;
-    // payment integration should be here
-    // verify payment
-    const conn = await pool.connect(); // pick a connection from the pool
-    //begin transaction
-    // KEEP THE TRANSACTION AS SMALL AS POSSIBLE
-    await conn.query("BEGIN");
-    //getting the row to make sure it is not booked
-    /// $1 is a variable which we are passing in the array as the second parameter of query function,
-    // Why do we use $1? -> this is to avoid SQL INJECTION
-    // (If you do ${id} directly in the query string,
-    // then it can be manipulated by the user to execute malicious SQL code)
-    const sql = "SELECT * FROM seats where id = $1 and isbooked = 0 FOR UPDATE";
-    const result = await conn.query(sql, [id]);
+    const { showId } = req.params;
 
-    //if no rows found then the operation should fail can't book
-    // This shows we Do not have the current seat available for booking
-    if (result.rowCount === 0) {
-      res.send({ error: "Seat already booked" });
-      return;
+    const show = await pool.query("SELECT id FROM shows WHERE id = $1", [showId]);
+    if (show.rowCount === 0) {
+      return res.status(404).json({ success: false, error: "Show not found" });
     }
-    //if we get the row, we are safe to update
-    const sqlU = "update seats set isbooked = 1, name = $2 where id = $1";
-    const updateResult = await conn.query(sqlU, [id, name]); // Again to avoid SQL INJECTION we are using $1 and $2 as placeholders
 
-    //end transaction by committing
-    await conn.query("COMMIT");
-    conn.release(); // release the connection back to the pool (so we do not keep the connection open unnecessarily)
-    res.send(updateResult);
-  } catch (ex) {
-    console.log(ex);
-    res.send(500);
+    const result = await pool.query(
+      `SELECT id, seat_number, isbooked
+       FROM seats
+       WHERE show_id = $1
+       ORDER BY seat_number`,
+      [showId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: "Failed to fetch seats" });
   }
 });
 
-app.listen(port, () => console.log("Server starting on port: " + port));
+// Book a seat
+app.put("/:seatId/:showId", authenticate, async (req, res) => {
+  const conn = await pool.connect();
+
+  try {
+    const showId = Number(req.params.showId);
+    const seatId = Number(req.params.seatId);
+    const userId = req.user.id;
+
+    if (!showId || !seatId) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid showId or seatId",
+      });
+    }
+
+    await conn.query("BEGIN");
+
+
+    const result = await conn.query(
+      `SELECT id, seat_number 
+       FROM seats 
+       WHERE id = $1 AND show_id = $2 AND isbooked = FALSE
+       FOR UPDATE`,
+      [seatId, showId]
+    );
+
+    if (result.rowCount === 0) {
+      await conn.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        error: "Seat already booked or not found",
+      });
+    }
+
+
+    await conn.query(
+      `UPDATE seats 
+       SET isbooked = TRUE, user_id = $3
+       WHERE id = $1 AND show_id = $2`,
+      [seatId, showId, userId]
+    );
+
+    const details = await conn.query(
+      `SELECT 
+          s.id,
+          s.seat_number,
+          sh.show_time,
+          sh.price,
+          m.title,
+          sc.name AS screen
+       FROM seats s
+       JOIN shows sh ON s.show_id = sh.id
+       JOIN movies m ON sh.movie_id = m.id
+       JOIN screens sc ON sh.screen_id = sc.id
+       WHERE s.id = $1 AND s.show_id = $2`,
+      [seatId, showId]
+    );
+
+    await conn.query("COMMIT");
+
+    const booking = details.rows[0];
+
+    res.json({
+      success: true,
+      message: "Seat booked successfully",
+      booking: {
+        seatId,
+        seatNumber: booking.seat_number,
+        movie: booking.title,
+        screen: booking.screen,
+        showTime: booking.show_time,
+        price: booking.price,
+      },
+    });
+
+  } catch (err) {
+    await conn.query("ROLLBACK");
+    console.error(err);
+
+    res.status(500).json({
+      success: false,
+      error: "Booking failed",
+    });
+
+  } finally {
+    conn.release();
+  }
+});
+
+app.listen(port, () => console.log("Server starting on :http://localhost:" + port));
